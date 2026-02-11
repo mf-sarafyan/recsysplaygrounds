@@ -4,12 +4,16 @@ Train/validation split by sampling users and artists.
 Level 1 (split_matrix): seen vs unseen users/artists → train, val_unseen_users,
   val_unseen_artists, val_cold_start.
 
-Level 2 (holdout_per_user): within any user×item matrix, hold out a fraction of
-  each user's interactions for evaluation. Use viewable matrix for recalc/filter,
-  held-out sets as y_true.
+Level 2 (holdout_per_user / holdout_per_item): within any user×item matrix, hold
+  out a fraction of each user's (or item's) interactions for evaluation.
+
+Sparse layout (CSR/CSC):
+  indptr has length n_rows+1 (CSR) or n_cols+1 (CSC). Row i's nonzeros (CSR) are
+  in data[indptr[i]:indptr[i+1]] with column indices indices[indptr[i]:indptr[i+1]].
+  So indptr[i+1] - indptr[i] = nnz in row i. Same for CSC with columns.
 """
 from dataclasses import dataclass
-from typing import List, Optional, Set, Tuple
+from typing import List, Optional, Set, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -94,11 +98,79 @@ def split_matrix(
     )
 
 
+def _holdout_counts(
+    nnz_per_entity: np.ndarray,
+    holdout_ratio: float,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    For each entity (row or column), compute how many entries to hold out and to keep viewable.
+    Ensures at least 1 viewable and, when nnz > 1, at least 1 held-out.
+    """
+    n_held = np.zeros_like(nnz_per_entity)
+    multi = nnz_per_entity > 1
+    if np.any(multi):
+        n_held[multi] = np.minimum(
+            np.maximum(1, (holdout_ratio * nnz_per_entity[multi]).astype(np.intp)),
+            nnz_per_entity[multi] - 1,
+        )
+    n_viewable = nnz_per_entity - n_held
+    return n_held, n_viewable
+
+
+def _shuffle_within_entities(
+    indptr: np.ndarray,
+    indices: np.ndarray,
+    data: np.ndarray,
+    nnz_per_entity: np.ndarray,
+    n_entities: int,
+    rng: np.random.Generator,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Shuffle nonzero entries independently within each entity (row or column).
+    Returns indices and data in shuffled order (by entity, then random within entity).
+    """
+    total_nnz = indices.size
+    entity_id = np.repeat(np.arange(n_entities, dtype=np.intp), nnz_per_entity)
+    random_key = rng.random(total_nnz)
+    sort_idx = np.lexsort((random_key, entity_id))
+    return indices[sort_idx], data[sort_idx]
+
+
+def _viewable_mask(
+    total_nnz: int,
+    indptr: np.ndarray,
+    nnz_per_entity: np.ndarray,
+    n_viewable: np.ndarray,
+) -> np.ndarray:
+    """Boolean mask: True for entries that remain viewable (first n_viewable per entity after shuffle)."""
+    position_in_entity = np.arange(total_nnz, dtype=np.intp) - np.repeat(
+        indptr[:-1], nnz_per_entity
+    )
+    return position_in_entity < np.repeat(n_viewable, nnz_per_entity)
+
+
+def _held_out_splits(
+    indices_sorted: np.ndarray,
+    viewable_mask: np.ndarray,
+    n_held: np.ndarray,
+    n_entities: int,
+    dtype: np.dtype,
+) -> List[np.ndarray]:
+    """Split held-out indices into one array per entity (for y_true)."""
+    total_held = int(n_held.sum())
+    if total_held == 0:
+        return [np.array([], dtype=dtype) for _ in range(n_entities)]
+    held_out_mask = ~viewable_mask
+    return list(
+        np.split(indices_sorted[held_out_mask], np.cumsum(n_held)[:-1])
+    )
+
+
 def holdout_per_user(
     user_items: csr_matrix,
     holdout_ratio: float = 0.2,
     random_state: Optional[int] = None,
-) -> Tuple[csr_matrix, List[Set[int]]]:
+) -> Tuple[csr_matrix, List[Union[Set[int], np.ndarray]]]:
     """
     Split each user's interactions into viewable (for model input) and held-out (for y_true).
 
@@ -119,56 +191,92 @@ def holdout_per_user(
     -------
     viewable : csr_matrix
         Same shape as user_items; a subset of nonzeros per row set to 0 (viewable = rest).
-    y_true_held_out : list of set of int
-        y_true_held_out[i] = set of column indices held out for user i (for evaluation).
+    y_true_held_out : list of set or ndarray of int
+        y_true_held_out[i] = column indices held out for user i (for evaluation).
     """
     rng = np.random.default_rng(random_state)
     n_users, n_items = user_items.shape
     user_items = user_items.tocsr()
+    indptr = user_items.indptr
+    indices = user_items.indices
+    data = user_items.data
+    total_nnz = indices.size
 
-    # Build viewable matrix: same structure but only "viewable" entries kept
-    viewable_data = []
-    viewable_indices = []
-    viewable_indptr = [0]
+    nnz_per_row = np.diff(indptr)
+    n_held, n_viewable = _holdout_counts(nnz_per_row, holdout_ratio)
 
-    y_true_held_out: List[Set[int]] = []
+    indices_sorted, data_sorted = _shuffle_within_entities(
+        indptr, indices, data, nnz_per_row, n_users, rng
+    )
+    viewable_mask = _viewable_mask(total_nnz, indptr, nnz_per_row, n_viewable)
 
-    for i in range(n_users):
-        row = user_items.getrow(i)
-        cols = row.indices
-        data = row.data
-        nnz = len(cols)
-
-        if nnz == 0:
-            y_true_held_out.append(set())
-            viewable_indptr.append(viewable_indptr[-1])
-            continue
-
-        if nnz == 1:
-            # Keep only viewable (all); hold out nothing so we can still compute user factor
-            viewable_data.extend(data.tolist())
-            viewable_indices.extend(cols.tolist())
-            y_true_held_out.append(set())
-        else:
-            # Shuffle and split: at least 1 viewable, at least 1 held out
-            perm = rng.permutation(nnz)
-            cols_perm = cols[perm]
-            data_perm = data[perm]
-            n_held = min(max(1, int(holdout_ratio * nnz)), nnz - 1)
-            n_viewable = nnz - n_held
-            viewable_cols = cols_perm[:n_viewable]
-            viewable_vals = data_perm[:n_viewable]
-            held_cols = cols_perm[n_viewable:]
-            viewable_data.extend(viewable_vals.tolist())
-            viewable_indices.extend(viewable_cols.tolist())
-            y_true_held_out.append(set(held_cols.tolist()))
-
-        viewable_indptr.append(len(viewable_data))
-
+    viewable_indptr = np.empty(n_users + 1, dtype=np.intp)
+    viewable_indptr[0] = 0
+    np.cumsum(n_viewable, out=viewable_indptr[1:])
     viewable = csr_matrix(
-        (viewable_data, viewable_indices, viewable_indptr),
+        (data_sorted[viewable_mask], indices_sorted[viewable_mask], viewable_indptr),
         shape=(n_users, n_items),
         dtype=user_items.dtype,
+    )
+    y_true_held_out = _held_out_splits(
+        indices_sorted, viewable_mask, n_held, n_users, indices.dtype
+    )
+    return viewable, y_true_held_out
+
+
+def holdout_per_item(
+    user_items: csr_matrix,
+    holdout_ratio: float = 0.2,
+    random_state: Optional[int] = None,
+) -> Tuple[csr_matrix, List[Union[Set[int], np.ndarray]]]:
+    """
+    Split each item's interactions into viewable (for model input) and held-out (for y_true).
+
+    For each column (item), a random fraction of nonzero entries are masked to 0 in the
+    viewable matrix and recorded as y_true. Use for cold-artist inverse evaluation:
+    rank users per artist and compare to held-out listeners.
+
+    Parameters
+    ----------
+    user_items : scipy.sparse.csr_matrix
+        Shape (n_users, n_items). Rows = users, columns = items.
+    holdout_ratio : float, default 0.2
+        Target fraction of each item's interactions to hold out (0 < holdout_ratio < 1).
+    random_state : int or None, default None
+        Random seed for reproducible splits.
+
+    Returns
+    -------
+    viewable : csr_matrix
+        Same shape as user_items; a subset of nonzeros per column set to 0 (viewable = rest).
+    y_true_held_out : list of set or ndarray of int
+        y_true_held_out[j] = row (user) indices held out for item j (for evaluation).
+    """
+    rng = np.random.default_rng(random_state)
+    n_users, n_items = user_items.shape
+    csc = user_items.tocsc()
+    indptr = csc.indptr
+    indices = csc.indices
+    data = csc.data
+    total_nnz = indices.size
+
+    nnz_per_col = np.diff(indptr)
+    n_held, n_viewable = _holdout_counts(nnz_per_col, holdout_ratio)
+
+    indices_sorted, data_sorted = _shuffle_within_entities(
+        indptr, indices, data, nnz_per_col, n_items, rng
+    )
+    viewable_mask = _viewable_mask(total_nnz, indptr, nnz_per_col, n_viewable)
+
+    viewable_rows = indices_sorted[viewable_mask]
+    viewable_cols = np.repeat(np.arange(n_items, dtype=indices.dtype), n_viewable)
+    viewable = csr_matrix(
+        (data_sorted[viewable_mask], (viewable_rows, viewable_cols)),
+        shape=(n_users, n_items),
+        dtype=user_items.dtype,
+    )
+    y_true_held_out = _held_out_splits(
+        indices_sorted, viewable_mask, n_held, n_items, indices.dtype
     )
     return viewable, y_true_held_out
 
